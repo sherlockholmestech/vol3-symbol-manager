@@ -118,16 +118,20 @@ fn render_search_tree(results: &[(&String, &Vec<String>)], shown: usize) -> Stri
     }
 
     let mut output = String::new();
-    output.push_str(&format!("{}\n", ".".bold()));
+    output.push_str(&format!("{}\n", "Matched symbol paths".bold()));
 
     if has_paths {
         tree.render_into(&mut output, "");
         let (dirs, files) = tree.counts();
         output.push_str(
             &format!(
-                "\n{} {}, {} {}",
+                "\n{} {} • {} {}",
                 dirs,
-                if dirs == 1 { "directory" } else { "directories" },
+                if dirs == 1 {
+                    "directory"
+                } else {
+                    "directories"
+                },
                 files,
                 if files == 1 { "file" } else { "files" }
             )
@@ -144,13 +148,18 @@ fn render_search_tree(results: &[(&String, &Vec<String>)], shown: usize) -> Stri
 #[derive(Default)]
 struct PathTree {
     children: BTreeMap<String, PathTree>,
+    is_file: bool,
 }
 
 impl PathTree {
     fn insert(&mut self, path: &str) {
         let mut current = self;
-        for segment in path.split('/').filter(|s| !s.is_empty()) {
+        let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
+        while let Some(segment) = segments.next() {
             current = current.children.entry(segment.to_string()).or_default();
+            if segments.peek().is_none() {
+                current.is_file = true;
+            }
         }
     }
 
@@ -160,25 +169,28 @@ impl PathTree {
             let is_last = index + 1 == count;
             let branch = if is_last { "└──" } else { "├──" };
 
-            if child.children.is_empty() {
-                // leaf = file
+            if child.is_file {
                 output.push_str(&format!(
                     "{}{} {}\n",
                     prefix,
                     branch.dimmed(),
-                    name.cyan()
+                    style_file_name(name)
                 ));
             } else {
-                // internal node = directory
+                let (collapsed_name, collapsed_child) = child.collapsed_dir_name(name);
                 output.push_str(&format!(
                     "{}{} {}\n",
                     prefix,
                     branch.dimmed(),
-                    format!("{name}/").bold()
+                    style_dir_name(&collapsed_name)
                 ));
-                let cont = if is_last { "    ".to_string() } else { "│   ".dimmed().to_string() };
+                let cont = if is_last {
+                    "    ".to_string()
+                } else {
+                    "│   ".dimmed().to_string()
+                };
                 let child_prefix = format!("{prefix}{cont}");
-                child.render_into(output, &child_prefix);
+                collapsed_child.render_into(output, &child_prefix);
             }
         }
     }
@@ -188,7 +200,7 @@ impl PathTree {
         let mut files = 0usize;
 
         for child in self.children.values() {
-            if child.children.is_empty() {
+            if child.is_file {
                 files += 1;
                 continue;
             }
@@ -200,6 +212,85 @@ impl PathTree {
         }
 
         (dirs, files)
+    }
+
+    fn collapsed_dir_name<'a>(&'a self, name: &str) -> (String, &'a PathTree) {
+        let mut parts = vec![name.to_string()];
+        let mut current = self;
+
+        loop {
+            if current.is_file || current.children.len() != 1 {
+                break;
+            }
+
+            let Some((child_name, child)) = current.children.iter().next() else {
+                break;
+            };
+
+            if child.is_file {
+                break;
+            }
+
+            parts.push(child_name.clone());
+            current = child;
+        }
+
+        (format!("{}/", parts.join("/")), current)
+    }
+}
+
+fn style_dir_name(name: &str) -> String {
+    name.blue().bold().to_string()
+}
+
+fn style_file_name(name: &str) -> String {
+    for ext in [".json.xz", ".json.gz", ".json"] {
+        if let Some(base) = name.strip_suffix(ext) {
+            return format!("{}{}", base.cyan().bold(), ext.dimmed());
+        }
+    }
+
+    name.cyan().bold().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_search_tree;
+
+    #[test]
+    fn render_search_tree_collapses_single_child_directories() {
+        let banner = String::from("Linux version 6.1");
+        let paths = vec![
+            String::from("Debian/amd64/6.1.0/1/debian.json.xz"),
+            String::from("Debian/amd64/6.1.0/1/debian-debug.json.xz"),
+        ];
+        let results = vec![(&banner, &paths)];
+
+        let rendered = render_search_tree(&results, 1);
+
+        assert!(rendered.contains("Matched symbol paths"));
+        assert!(rendered.contains("Debian/amd64/6.1.0/1/"));
+        assert!(rendered.contains("debian"));
+        assert!(rendered.contains("2 files"));
+        assert!(!rendered.contains("\n.\n"));
+    }
+
+    #[test]
+    fn render_search_tree_counts_directories_after_collapsing() {
+        let banner = String::from("Linux version 5.4");
+        let paths = vec![
+            String::from("Ubuntu/amd64/5.4.0/1/ubuntu.json.xz"),
+            String::from("Ubuntu/arm64/5.4.0/1/ubuntu-arm.json.xz"),
+        ];
+        let results = vec![(&banner, &paths)];
+
+        let rendered = render_search_tree(&results, 1);
+
+        assert!(rendered.contains("7 directories"));
+        assert!(rendered.contains("2 files"));
+        assert!(rendered.contains("Ubuntu/"));
+        assert!(rendered.contains("amd64/5.4.0/1/"));
+        assert!(rendered.contains("arm64/5.4.0/1/"));
     }
 }
 
