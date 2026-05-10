@@ -1,22 +1,37 @@
-name: Rust
+name: Release
 
 on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
+  release:
+    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
 
-jobs:
-  build:
+permissions:
+  contents: write
 
+jobs:
+  build-linux:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev ca-certificates
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: tar -C target/release -czf vol3sm-linux-x86_64.tar.gz vol3sm
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vol3sm-linux-x86_64.tar.gz

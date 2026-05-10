@@ -1,26 +1,8 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
-
-pub type BannerIndex = HashMap<String, Vec<String>>;
-
-pub fn fetch_banner_index(url: &str) -> Result<BannerIndex> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("vol3sm/0.1.0")
-        .build()?;
-    let resp = client
-        .get(url)
-        .send()
-        .context("Failed to reach GitHub — check your internet connection")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {} fetching banner index", resp.status());
-    }
-    let index: BannerIndex = resp.json().context("Failed to parse banners_plain.json")?;
-    Ok(index)
-}
 
 pub fn download_symbol(url: &str, dest_dir: &Path, symbol_path: &str) -> Result<()> {
     let filename = Path::new(symbol_path)

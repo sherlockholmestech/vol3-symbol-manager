@@ -2,20 +2,20 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 mod github;
+mod sources;
 mod symbols;
 
-use github::{download_symbol, fetch_banner_index};
+use github::download_symbol;
+use sources::{SymbolEntry, fetch_all_sources};
 use symbols::{dest_dir_for, find_symbols_dir, list_local_symbols};
-
-const BANNERS_URL: &str = "https://raw.githubusercontent.com/Abyss-W4tcher/volatility3-symbols/master/banners/banners_plain.json";
-const RAW_BASE: &str = "https://github.com/Abyss-W4tcher/volatility3-symbols/raw/master";
 
 #[derive(Parser)]
 #[command(name = "vol3sm")]
 #[command(
-    about = "Volatility3 symbol manager — search and install ISF symbols from Abyss-W4tcher/volatility3-symbols"
+    about = "Volatility3 symbol manager — search and install ISF symbols from public symbol indexes"
 )]
 #[command(version)]
 struct Cli {
@@ -36,7 +36,7 @@ enum Commands {
 
     /// Download and install a symbol into volatility3
     Install {
-        /// Repository path  (e.g. "Debian/amd64/5.4.0/1/Debian_5.4.0-1-amd64_...json.xz")
+        /// Repository path or numeric id from the last search results
         path: Option<String>,
         /// Exact kernel banner string (from `vol.py banners` output)
         #[arg(short, long, value_name = "BANNER")]
@@ -61,19 +61,9 @@ fn main() -> Result<()> {
 }
 
 fn cmd_search(query: &str, limit: usize) -> Result<()> {
-    eprintln!("{}", "Fetching symbol index...".dimmed());
-    let index = fetch_banner_index(BANNERS_URL)?;
-
-    let q = query.to_lowercase();
-    let mut results: Vec<(&String, &Vec<String>)> = index
-        .iter()
-        .filter(|(banner, paths)| {
-            banner.to_lowercase().contains(&q)
-                || paths.iter().any(|p| p.to_lowercase().contains(&q))
-        })
-        .collect();
-
-    results.sort_by_key(|(b, _)| b.as_str());
+    eprintln!("{}", "Fetching symbol indexes...".dimmed());
+    let entries = fetch_all_sources()?;
+    let results = search_entries(&entries, query);
 
     if results.is_empty() {
         println!("No symbols found matching '{}'.", query);
@@ -83,6 +73,7 @@ fn cmd_search(query: &str, limit: usize) -> Result<()> {
     let total = results.len();
     let shown = total.min(limit);
     let tree = render_search_tree(&results, shown);
+    write_last_search_results(query, &results[..shown])?;
 
     println!(
         "Found {} match{} for {} (showing {}):\n",
@@ -106,15 +97,280 @@ fn cmd_search(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn render_search_tree(results: &[(&String, &Vec<String>)], shown: usize) -> String {
+fn search_entries<'a>(entries: &'a [SymbolEntry], query: &str) -> Vec<&'a SymbolEntry> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut hits = entries
+        .iter()
+        .filter_map(|entry| score_entry(entry, query).map(|score| (score, entry)))
+        .collect::<Vec<_>>();
+
+    hits.sort_by(|(score_a, entry_a), (score_b, entry_b)| {
+        score_b
+            .cmp(score_a)
+            .then_with(|| entry_a.banner.cmp(&entry_b.banner))
+            .then_with(|| entry_a.source_id.cmp(&entry_b.source_id))
+            .then_with(|| entry_a.path.cmp(&entry_b.path))
+    });
+
+    hits.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn score_entry(entry: &SymbolEntry, query: &str) -> Option<i32> {
+    let query_lower = query.to_lowercase();
+    let query_normalized = normalize_search_text(query);
+    let query_tokens = tokenize_search_text(query);
+    let basename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+    let display_path = entry.display_path();
+
+    let fields = [
+        SearchField::new(&display_path),
+        SearchField::new(basename),
+        SearchField::new(&entry.banner),
+        SearchField::new(&entry.source_name),
+    ];
+
+    let mut score = 0;
+    let mut whole_query_match = false;
+
+    for (idx, field) in fields.iter().enumerate() {
+        if field.lower.contains(&query_lower) {
+            score += match idx {
+                0 => 280,
+                1 => 320,
+                2 => 220,
+                _ => 80,
+            };
+            whole_query_match = true;
+        }
+
+        if !query_normalized.is_empty() && field.normalized.contains(&query_normalized) {
+            score += match idx {
+                0 => 160,
+                1 => 180,
+                2 => 140,
+                _ => 50,
+            };
+            whole_query_match = true;
+        }
+    }
+
+    let mut matched_tokens = 0;
+    for token in &query_tokens {
+        let best = fields
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| score_token_against_field(token, field, idx))
+            .max()
+            .unwrap_or(0);
+
+        if best > 0 {
+            matched_tokens += 1;
+            score += best;
+        }
+    }
+
+    if !whole_query_match && matched_tokens < query_tokens.len() {
+        return None;
+    }
+
+    if query_tokens.len() == 1 {
+        let token = &query_tokens[0];
+        let best_subsequence = fields
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, field)| {
+                subsequence_score(token, &field.compact).map(|subscore| {
+                    let base = match idx {
+                        0 => 35,
+                        1 => 55,
+                        2 => 25,
+                        _ => 10,
+                    };
+                    base + subscore.min(30) as i32
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        score += best_subsequence;
+    }
+
+    (score > 0).then_some(score)
+}
+
+struct SearchField {
+    lower: String,
+    normalized: String,
+    compact: String,
+    tokens: Vec<String>,
+}
+
+impl SearchField {
+    fn new(value: &str) -> Self {
+        let lower = value.to_lowercase();
+        let normalized = normalize_search_text(value);
+        let compact = normalized.replace(' ', "");
+        let tokens = tokenize_search_text(value);
+        Self {
+            lower,
+            normalized,
+            compact,
+            tokens,
+        }
+    }
+}
+
+fn score_token_against_field(token: &str, field: &SearchField, field_idx: usize) -> i32 {
+    let base = match field_idx {
+        0 => 70,
+        1 => 90,
+        2 => 55,
+        _ => 25,
+    };
+    let allow_fuzzy = is_fuzzy_text_token(token);
+
+    let mut best = if field.lower.contains(token) {
+        base + 20
+    } else {
+        0
+    };
+
+    for candidate in &field.tokens {
+        if candidate == token {
+            best = best.max(base + 60);
+            continue;
+        }
+        if candidate.starts_with(token) || (allow_fuzzy && token.starts_with(candidate)) {
+            best = best.max(base + 40);
+            continue;
+        }
+        if candidate.contains(token) {
+            best = best.max(base + 25);
+            continue;
+        }
+
+        if allow_fuzzy && token.len() >= 4 && candidate.len() >= 4 {
+            let max_distance = if token.len().max(candidate.len()) <= 5 {
+                1
+            } else {
+                2
+            };
+            if let Some(distance) = bounded_edit_distance(token, candidate, max_distance) {
+                let fuzzy = match distance {
+                    0 => base + 60,
+                    1 => base + 22,
+                    2 => base + 12,
+                    _ => 0,
+                };
+                best = best.max(fuzzy);
+            }
+        }
+
+        if allow_fuzzy && token.len() >= 3 {
+            if let Some(subscore) = subsequence_score(token, candidate) {
+                best = best.max(base + subscore.min(18) as i32);
+            }
+        }
+    }
+
+    best
+}
+
+fn normalize_search_text(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+') {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn tokenize_search_text(input: &str) -> Vec<String> {
+    normalize_search_text(input)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_fuzzy_text_token(token: &str) -> bool {
+    token.chars().all(|ch| ch.is_ascii_alphabetic())
+}
+
+fn subsequence_score(needle: &str, haystack: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+
+    let mut positions = Vec::with_capacity(needle.len());
+    let mut haystack_iter = haystack.char_indices();
+
+    for needle_char in needle.chars() {
+        let mut found = None;
+        for (idx, haystack_char) in haystack_iter.by_ref() {
+            if haystack_char == needle_char {
+                found = Some(idx);
+                break;
+            }
+        }
+
+        match found {
+            Some(idx) => positions.push(idx),
+            None => return None,
+        }
+    }
+
+    let span = positions.last()? - positions.first()? + 1;
+    Some(needle.len().saturating_mul(8).saturating_sub(span))
+}
+
+fn bounded_edit_distance(a: &str, b: &str, max_distance: usize) -> Option<usize> {
+    let a_chars = a.chars().collect::<Vec<_>>();
+    let b_chars = b.chars().collect::<Vec<_>>();
+    if a_chars.len().abs_diff(b_chars.len()) > max_distance {
+        return None;
+    }
+
+    let mut prev = (0..=b_chars.len()).collect::<Vec<_>>();
+    let mut curr = vec![0; b_chars.len() + 1];
+
+    for (i, a_char) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        let mut row_min = curr[0];
+
+        for (j, b_char) in b_chars.iter().enumerate() {
+            let cost = usize::from(a_char != b_char);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            row_min = row_min.min(curr[j + 1]);
+        }
+
+        if row_min > max_distance {
+            return None;
+        }
+
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    let distance = prev[b_chars.len()];
+    (distance <= max_distance).then_some(distance)
+}
+
+fn render_search_tree(results: &[&SymbolEntry], shown: usize) -> String {
     let mut tree = PathTree::default();
     let mut has_paths = false;
 
-    for (_banner, paths) in results.iter().take(shown) {
-        for path in paths.iter() {
-            tree.insert(path);
-            has_paths = true;
-        }
+    for (id, entry) in results.iter().take(shown).enumerate() {
+        tree.insert(&entry.display_path(), id);
+        has_paths = true;
     }
 
     let mut output = String::new();
@@ -142,23 +398,67 @@ fn render_search_tree(results: &[(&String, &Vec<String>)], shown: usize) -> Stri
         output.push_str("└── (no symbol path)\n\n0 directories, 0 files");
     }
 
+    output.push_str(&format!(
+        "\n\n{}",
+        "Use: vol3sm install <id>  or  vol3sm install \"<source:path>\"".dimmed()
+    ));
+
     output.trim_end().to_string()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LastSearchResults {
+    query: String,
+    entries: Vec<SymbolEntry>,
+}
+
+fn write_last_search_results(query: &str, results: &[&SymbolEntry]) -> Result<()> {
+    let cache = LastSearchResults {
+        query: query.to_string(),
+        entries: results.iter().map(|entry| (*entry).clone()).collect(),
+    };
+    let path = search_cache_path();
+    let data = serde_json::to_vec_pretty(&cache)?;
+    std::fs::write(&path, data)?;
+    Ok(())
+}
+
+fn read_last_search_results() -> Result<LastSearchResults> {
+    let path = search_cache_path();
+    let data = std::fs::read(&path).map_err(|err| {
+        anyhow::anyhow!(
+            "Could not read last search results from {}: {}",
+            path.display(),
+            err
+        )
+    })?;
+    Ok(serde_json::from_slice(&data)?)
+}
+
+fn search_cache_path() -> PathBuf {
+    if let Ok(path) = std::env::var("VOL3SM_SEARCH_CACHE") {
+        return PathBuf::from(path);
+    }
+
+    std::env::temp_dir().join("vol3sm-last-search.json")
 }
 
 #[derive(Default)]
 struct PathTree {
     children: BTreeMap<String, PathTree>,
     is_file: bool,
+    file_id: Option<usize>,
 }
 
 impl PathTree {
-    fn insert(&mut self, path: &str) {
+    fn insert(&mut self, path: &str, file_id: usize) {
         let mut current = self;
         let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
         while let Some(segment) = segments.next() {
             current = current.children.entry(segment.to_string()).or_default();
             if segments.peek().is_none() {
                 current.is_file = true;
+                current.file_id = Some(file_id);
             }
         }
     }
@@ -171,10 +471,11 @@ impl PathTree {
 
             if child.is_file {
                 output.push_str(&format!(
-                    "{}{} {}\n",
+                    "{}{} {}{}\n",
                     prefix,
                     branch.dimmed(),
-                    style_file_name(name)
+                    style_file_name(name),
+                    style_file_id(child.file_id)
                 ));
             } else {
                 let (collapsed_name, collapsed_child) = child.collapsed_dir_name(name);
@@ -253,68 +554,238 @@ fn style_file_name(name: &str) -> String {
     name.cyan().bold().to_string()
 }
 
+fn style_file_id(file_id: Option<usize>) -> String {
+    file_id
+        .map(|id| format!(" {}", format!("[{}]", id).dimmed()))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::render_search_tree;
+    use super::{
+        SymbolEntry, bounded_edit_distance, is_fuzzy_text_token, read_last_search_results,
+        render_search_tree, resolve_search_id, search_cache_path, search_entries,
+        subsequence_score, tokenize_search_text, write_last_search_results,
+    };
+    use std::sync::{Mutex, OnceLock};
+
+    fn entry(source_id: &str, banner: &str, path: &str) -> SymbolEntry {
+        SymbolEntry {
+            source_id: source_id.to_string(),
+            source_name: source_id.to_string(),
+            banner: banner.to_string(),
+            path: path.to_string(),
+            download_url: format!("https://example.invalid/{path}"),
+        }
+    }
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn render_search_tree_collapses_single_child_directories() {
-        let banner = String::from("Linux version 6.1");
-        let paths = vec![
-            String::from("Debian/amd64/6.1.0/1/debian.json.xz"),
-            String::from("Debian/amd64/6.1.0/1/debian-debug.json.xz"),
+        let results = vec![
+            entry(
+                "abyss",
+                "Linux version 6.1",
+                "Debian/amd64/6.1.0/1/debian.json.xz",
+            ),
+            entry(
+                "abyss",
+                "Linux version 6.1",
+                "Debian/amd64/6.1.0/1/debian-debug.json.xz",
+            ),
         ];
-        let results = vec![(&banner, &paths)];
+        let result_refs = results.iter().collect::<Vec<_>>();
 
-        let rendered = render_search_tree(&results, 1);
+        let rendered = render_search_tree(&result_refs, 2);
 
         assert!(rendered.contains("Matched symbol paths"));
-        assert!(rendered.contains("Debian/amd64/6.1.0/1/"));
+        assert!(rendered.contains("abyss:Debian/amd64/6.1.0/1/"));
         assert!(rendered.contains("debian"));
+        assert!(rendered.contains("[0]"));
+        assert!(rendered.contains("[1]"));
         assert!(rendered.contains("2 files"));
         assert!(!rendered.contains("\n.\n"));
     }
 
     #[test]
     fn render_search_tree_counts_directories_after_collapsing() {
-        let banner = String::from("Linux version 5.4");
-        let paths = vec![
-            String::from("Ubuntu/amd64/5.4.0/1/ubuntu.json.xz"),
-            String::from("Ubuntu/arm64/5.4.0/1/ubuntu-arm.json.xz"),
+        let results = vec![
+            entry(
+                "abyss",
+                "Linux version 5.4",
+                "Ubuntu/amd64/5.4.0/1/ubuntu.json.xz",
+            ),
+            entry(
+                "abyss",
+                "Linux version 5.4",
+                "Ubuntu/arm64/5.4.0/1/ubuntu-arm.json.xz",
+            ),
         ];
-        let results = vec![(&banner, &paths)];
+        let result_refs = results.iter().collect::<Vec<_>>();
 
-        let rendered = render_search_tree(&results, 1);
+        let rendered = render_search_tree(&result_refs, 2);
 
         assert!(rendered.contains("7 directories"));
         assert!(rendered.contains("2 files"));
-        assert!(rendered.contains("Ubuntu/"));
+        assert!(rendered.contains("abyss:Ubuntu/"));
         assert!(rendered.contains("amd64/5.4.0/1/"));
         assert!(rendered.contains("arm64/5.4.0/1/"));
+    }
+
+    #[test]
+    fn render_search_tree_shows_ids_next_to_files() {
+        let results = vec![
+            entry(
+                "abyss",
+                "Linux version 6.1",
+                "Debian/amd64/6.1.0/1/debian.json.xz",
+            ),
+            entry(
+                "leludo",
+                "Linux version 6.1",
+                "profiles/debian/debian.json.xz",
+            ),
+        ];
+        let result_refs = results.iter().collect::<Vec<_>>();
+
+        let rendered = render_search_tree(&result_refs, 2);
+
+        assert!(rendered.contains("[0]"));
+        assert!(rendered.contains("[1]"));
+        assert!(rendered.contains("vol3sm install <id>"));
+    }
+
+    #[test]
+    fn fuzzy_search_ranks_best_path_match_first() {
+        let entries = vec![
+            entry(
+                "abyss",
+                "Linux version 6.2.0-1007-aws",
+                "Ubuntu/amd64/6.2.0/1007/aws/Ubuntu_6.2.0-1007-aws_amd64.json.xz",
+            ),
+            entry(
+                "leludo",
+                "Linux version 6.2.0-1007-aws",
+                "profiles/ubuntu22/linux-image-unsigned-6.2.0-1007-aws-dbgsym_x86_64.json.xz",
+            ),
+            entry(
+                "p0d",
+                "",
+                "symbols/Ubuntu/5.4.0-99/5.4.0-99-generic/amd64/foo.json.xz",
+            ),
+        ];
+
+        let results = search_entries(&entries, "ubuntu aws 1007");
+
+        assert_eq!(results[0].source_id, "abyss");
+        assert_eq!(results[1].source_id, "leludo");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn fuzzy_search_tolerates_small_typos() {
+        let entries = vec![entry(
+            "abyss",
+            "Linux version 6.2.0-1007-aws",
+            "Ubuntu/amd64/6.2.0/1007/aws/Ubuntu_6.2.0-1007-aws_amd64.json.xz",
+        )];
+
+        let results = search_entries(&entries, "ubntu 1007 aws");
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn bounded_edit_distance_respects_limit() {
+        assert_eq!(bounded_edit_distance("ubuntu", "ubntu", 2), Some(1));
+        assert_eq!(bounded_edit_distance("ubuntu", "debian", 2), None);
+    }
+
+    #[test]
+    fn subsequence_score_prefers_compact_matches() {
+        let compact = subsequence_score("ubt", "ubuntu").unwrap();
+        let spread = subsequence_score("ubt", "u_bu_n_tu").unwrap();
+
+        assert!(compact > spread);
+    }
+
+    #[test]
+    fn tokenization_preserves_kernel_versions() {
+        assert_eq!(
+            tokenize_search_text("ubntu 6.2.0-1007 aws"),
+            vec!["ubntu", "6.2.0-1007", "aws"]
+        );
+    }
+
+    #[test]
+    fn fuzzy_logic_only_applies_to_text_tokens() {
+        assert!(is_fuzzy_text_token("ubuntu"));
+        assert!(!is_fuzzy_text_token("6.2.0-1007"));
+        assert!(!is_fuzzy_text_token("ubuntu22"));
+    }
+
+    #[test]
+    fn search_results_are_cached_and_resolvable_by_id() {
+        let _guard = test_lock().lock().unwrap();
+        let cache_path =
+            std::env::temp_dir().join(format!("vol3sm-test-cache-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("VOL3SM_SEARCH_CACHE", &cache_path);
+        }
+
+        let entries = vec![
+            entry(
+                "abyss",
+                "Linux version 6.1",
+                "Debian/amd64/6.1.0/1/debian.json.xz",
+            ),
+            entry(
+                "leludo",
+                "Linux version 6.1",
+                "profiles/debian/debian.json.xz",
+            ),
+        ];
+        let entry_refs = entries.iter().collect::<Vec<_>>();
+
+        write_last_search_results("debian 6.1", &entry_refs).unwrap();
+
+        let cache = read_last_search_results().unwrap();
+        assert_eq!(cache.query, "debian 6.1");
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(resolve_search_id(1).unwrap().source_id, "leludo");
+
+        let _ = std::fs::remove_file(search_cache_path());
+        unsafe {
+            std::env::remove_var("VOL3SM_SEARCH_CACHE");
+        }
     }
 }
 
 fn cmd_install(path: Option<String>, banner: Option<String>) -> Result<()> {
-    let symbol_path = match (path, banner) {
-        (Some(p), None) => p,
+    let entry = match (path, banner) {
+        (Some(p), None) => resolve_path(&p)?,
 
         (None, Some(b)) => {
-            eprintln!("{}", "Fetching symbol index...".dimmed());
-            let index = fetch_banner_index(BANNERS_URL)?;
-            let paths = index
-                .get(&b)
-                .ok_or_else(|| anyhow::anyhow!("No symbol found for banner:\n  {}", b))?;
-            if paths.is_empty() {
-                anyhow::bail!("Banner matched but has no associated symbol paths.");
+            eprintln!("{}", "Fetching symbol indexes...".dimmed());
+            let matches = fetch_all_sources()?
+                .into_iter()
+                .filter(|entry| entry.banner == b)
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                anyhow::bail!("No symbol found for banner:\n  {}", b);
             }
-            if paths.len() > 1 {
+            if matches.len() > 1 {
                 println!("Multiple symbols match this banner:");
-                for (i, p) in paths.iter().enumerate() {
-                    println!("  [{}] {}", i, p.green());
+                for (i, entry) in matches.iter().enumerate() {
+                    println!("  [{}] {}", i, entry.display_path().green());
                 }
-                println!("Installing: {}", paths[0].green());
+                println!("Installing: {}", matches[0].display_path().green());
             }
-            paths[0].clone()
+            matches[0].clone()
         }
 
         (None, None) => {
@@ -330,17 +801,59 @@ fn cmd_install(path: Option<String>, banner: Option<String>) -> Result<()> {
     };
 
     let symbols_dir = find_symbols_dir()?;
-    let dest = dest_dir_for(&symbols_dir, &symbol_path);
+    let dest = dest_dir_for(&symbols_dir, &entry.path);
     std::fs::create_dir_all(&dest)?;
 
-    let url = format!("{}/{}", RAW_BASE, symbol_path);
-
-    println!("Symbol : {}", symbol_path.green());
+    println!("Source : {}", entry.source_name.green());
+    println!("Symbol : {}", entry.display_path().green());
     println!("Dest   : {}", dest.display().to_string().yellow());
 
-    download_symbol(&url, &dest, &symbol_path)?;
+    download_symbol(&entry.download_url, &dest, &entry.path)?;
 
     Ok(())
+}
+
+fn resolve_path(path: &str) -> Result<SymbolEntry> {
+    if let Ok(id) = path.parse::<usize>() {
+        return resolve_search_id(id);
+    }
+
+    eprintln!("{}", "Fetching symbol indexes...".dimmed());
+    let entries = fetch_all_sources()?;
+    let matches = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.display_path() == path
+                || (!path.contains(':') && entry.source_id == "abyss" && entry.path == path)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [entry] => Ok(entry.clone()),
+        [] => anyhow::bail!(
+            "No symbol found for path '{}'. Use `vol3sm search <query>` and install the source-qualified path.",
+            path
+        ),
+        _ => {
+            println!("Multiple symbols match this path:");
+            for (i, entry) in matches.iter().enumerate() {
+                println!("  [{}] {}", i, entry.display_path().green());
+            }
+            println!("Installing: {}", matches[0].display_path().green());
+            Ok(matches[0].clone())
+        }
+    }
+}
+
+fn resolve_search_id(id: usize) -> Result<SymbolEntry> {
+    let cache = read_last_search_results()?;
+    cache.entries.get(id).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Search id {} is out of range for the last search '{}'. Run `vol3sm search ...` again.",
+            id,
+            cache.query
+        )
+    })
 }
 
 fn cmd_local() -> Result<()> {
