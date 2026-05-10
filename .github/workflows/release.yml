@@ -26,7 +26,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Package binary
         run: tar -C target/release -czf vol3sm-linux-x86_64.tar.gz vol3sm
